@@ -4,7 +4,7 @@ Android instances in containers on a Linux PC or VM, built on [Redroid](https://
 
 - several instances side by side, each on its own Android version (8.1 to 16, default 14)
 - root over adb, plus per-app root inside Android through Magisk
-- ARM and ARM64 apps on x86_64 hosts through `libndk_translation` (included in Redroid images)
+- ARM64 apps on x86_64 hosts through `libndk_translation` (included in Redroid images). The Android 14 image has no 32-bit translation, so armeabi-v7a-only apps do not run there; Android 11/12 images are expected to ship both (not yet verified)
 - no Google services; microG is planned (see [docs/design.md](docs/design.md))
 - full instance snapshots and per-app backup and restore
 
@@ -23,6 +23,19 @@ sudo ./vedroid host-setup     # loads binder_linux and keeps it loaded on boot
 
 If `binder_linux` is missing, install your distro's extra kernel modules (on Ubuntu, `linux-modules-extra-$(uname -r)`). On btrfs, snapshots are instant subvolume snapshots, but those commands need sudo. On other filesystems, snapshots fall back to compressed tarballs that keep UIDs and SELinux labels.
 
+### binfmt_misc on the host
+
+To run ARM *executables* (not just libraries), Redroid's init registers `arm64_exe`, `arm64_dyn`, `arm_exe` and `arm_dyn` in `binfmt_misc`. That table is global to the host kernel, so the entries show up in the host's `/proc/sys/fs/binfmt_misc` and stay after the container stops. They point at a path that exists only inside Android, so on the host itself ARM binaries fail with "not found", and they conflict with `qemu-user-static` if you install it.
+
+The stock entries use the `P` flag, which breaks ARM programs started by name through `PATH` (Termux's setup fails, for example). Vedroid images ship the same entries without `P`. An existing entry is never replaced, so clear the old ones once and recreate your instances:
+
+```sh
+sudo ./vedroid host-setup --clean-binfmt
+./vedroid recreate main
+```
+
+`host-check` warns when stale entries are present.
+
 ## Quick start
 
 ```sh
@@ -31,6 +44,7 @@ If `binder_linux` is missing, install your distro's extra kernel modules (on Ubu
 ./vedroid list
 ./vedroid view main                   # opens the screen with scrcpy
 ./vedroid install main app.apk
+./vedroid recreate main               # rebuild the image after a Vedroid update; keeps data
 ```
 
 The first `create` for a given version builds the `vedroid/android:<ver>-magisk` image. Use `--no-magisk` for a stock image without in-Android root.

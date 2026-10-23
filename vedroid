@@ -39,6 +39,7 @@ Usage: vedroid <command> [args]
 Host
   host-check                     Check kernel modules, container engine, filesystem
   host-setup                     Load binder modules and create the data root (needs root)
+  host-setup --clean-binfmt      Remove the ARM binfmt_misc entries Redroid registered on the host (needs root)
 
 Images
   build-image [--android VER] [--no-magisk]
@@ -47,6 +48,7 @@ Images
 Instances
   create <name> [--android VER] [--no-magisk] [--port N] [--size WxH] [--dpi N]
   start <name> | stop <name> | restart <name>
+  recreate <name>                Rebuild the image and replace the container (keeps data)
   rm <name> [--keep-data]
   list
   shell <name>                   Root adb shell
@@ -179,11 +181,32 @@ cmd_host_check() {
   mkdir -p "$VEDROID_HOME" 2>/dev/null || true
   if is_btrfs "$VEDROID_HOME"; then echo "storage:  btrfs (instant snapshots; needs sudo)"; else echo "storage:  $(fs_type "$VEDROID_HOME") (snapshots use tar)"; fi
   echo "cpu:      $(uname -m)"
+  local e stale=""
+  for e in "${BINFMT_ENTRIES[@]}"; do
+    grep -q '^flags: .*P' "/proc/sys/fs/binfmt_misc/$e" 2>/dev/null && stale+=" $e"
+  done
+  if [[ -n "$stale" ]]; then
+    echo "binfmt:   WARNING stale entries with flag P:$stale (arm64 programs run via PATH fail)"
+    echo "          fix: sudo vedroid host-setup --clean-binfmt, then vedroid recreate <name>"
+  fi
   [[ $ok == 1 ]] || exit 1
 }
 
+BINFMT_ENTRIES=(arm64_exe arm64_dyn arm_exe arm_dyn)
+
 cmd_host_setup() {
   [[ $EUID -eq 0 ]] || die "host-setup needs root"
+  if [[ "${1:-}" == --clean-binfmt ]]; then
+    # binfmt_misc is global to the host kernel; Redroid's init registers these on
+    # boot, and an existing entry is never replaced, so stale ones must go first.
+    local e
+    for e in "${BINFMT_ENTRIES[@]}"; do
+      [[ -e /proc/sys/fs/binfmt_misc/$e ]] && echo -1 > "/proc/sys/fs/binfmt_misc/$e" && info "removed binfmt entry $e"
+    done
+    info "binfmt entries cleared; running instances need 'vedroid recreate' (or restart) to register them again"
+    return 0
+  fi
+  [[ $# -eq 0 ]] || die "host-setup: unknown option $1"
   modprobe binder_linux devices="binder,hwbinder,vndbinder" || die "cannot load binder_linux; install your distro's extra kernel modules (e.g. linux-modules-extra-$(uname -r))"
   modprobe ashmem_linux 2>/dev/null || true
   if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]; then
@@ -215,6 +238,13 @@ cmd_build_image() {
   local tag; tag="$(image_tag "$android" "$magisk")"
   local ctx; ctx="$(mktemp -d)"
   echo "FROM redroid/redroid:${android}-latest" > "$ctx/Dockerfile"
+  if [[ "$(uname -m)" == x86_64 ]]; then
+    # Stock entries carry the P flag, which makes the translator realpath() a bare
+    # argv[0]; arm64 programs found through PATH then fail. Same entries, no P.
+    cp -r "$VEDROID_SRC/images/binfmt" "$ctx/binfmt"
+    chmod 0644 "$ctx"/binfmt/*
+    echo "COPY binfmt /system/etc/binfmt_misc/" >> "$ctx/Dockerfile"
+  fi
   if [[ $magisk == 1 ]]; then
     "$VEDROID_SRC/images/magisk/prepare.sh" "$ctx/magisk"
     echo "COPY magisk /" >> "$ctx/Dockerfile"
@@ -315,6 +345,16 @@ cmd_stop() {
 }
 
 cmd_restart() { cmd_stop "$1"; cmd_start "$1"; }
+
+cmd_recreate() {
+  load_inst "${1:?recreate <name>}"
+  # Rebuild the image for this instance's version and flavour, then replace the
+  # container. /data lives on the host, so apps, settings and snapshots stay.
+  if [[ "$MAGISK" == 1 ]]; then cmd_build_image --android "$ANDROID"; else cmd_build_image --android "$ANDROID" --no-magisk; fi
+  cmd_stop "$NAME"
+  engine rm -f "$(cname "$NAME")" >/dev/null 2>&1 || true
+  cmd_start "$NAME"
+}
 
 cmd_rm() {
   load_inst "${1:?rm <name>}"
@@ -590,6 +630,7 @@ main() {
     start)       cmd_start "$@" ;;
     stop)        cmd_stop "$@" ;;
     restart)     cmd_restart "$@" ;;
+    recreate)    cmd_recreate "$@" ;;
     rm)          cmd_rm "$@" ;;
     list|ls)     cmd_list "$@" ;;
     shell)       cmd_shell "$@" ;;
