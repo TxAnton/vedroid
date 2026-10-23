@@ -44,6 +44,11 @@ install -m 0644 "$apk" "$dest/magisk.apk"
 # like it, and without it uninstalls the app as a "signature mismatch".
 unzip -q -o "$apk" assets/stub.apk -d "$tmp"
 install -m 0644 "$tmp/assets/stub.apk" "$dest/stub.apk"
+# Scripts that /data/adb/magisk needs (the app checks util_functions.sh for the
+# version); setup-data.sh copies them there at boot.
+unzip -q -o "$apk" 'assets/*.sh' -d "$tmp"
+install -m 0755 "$tmp"/assets/*.sh "$dest/"
+install -m 0755 "$HERE/setup-data.sh" "$dest/vedroid-setup-data"
 
 # Magisk rewrites bootanim.rc when updated from its app; keep the stock one
 # next to it so Magisk can restore it.

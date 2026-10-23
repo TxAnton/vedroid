@@ -69,6 +69,8 @@ Magisk runs from `/sbin` (Magisk 30.6, from the ayasa520 fork's v30.7 release). 
 ./vedroid shell main '/sbin/su 2000 -c "/sbin/su -c id"'   # -> uid=0(root)
 ```
 
+The Magisk app works as on a phone: Superuser prompts, the Superuser list and Modules. Magisk's own files in `/data/adb/magisk` are set up at boot, so the app never asks for "additional setup". Modules take effect after `./vedroid restart main`.
+
 ## Backups
 
 ```sh
