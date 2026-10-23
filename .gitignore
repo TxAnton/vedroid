@@ -1,0 +1,4 @@
+*.apk
+*.tar
+*.tar.zst
+.cache/

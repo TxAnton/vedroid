@@ -1,0 +1,30 @@
+# Design notes
+
+The full write-up is the "Vedroid: Android container design" doc. This file keeps the decisions that the code depends on.
+
+## Decisions
+
+| Topic | Decision | Why |
+|---|---|---|
+| Base | Redroid, not Waydroid | Supports several instances at once and Android 8.1 to 16. Waydroid runs one instance per host and ships Android 13 officially. |
+| Host | x86_64 (AMD) Linux PC or VM | The user's hardware |
+| ARM apps | `libndk_translation`, already included in Redroid images | Recommended on AMD; libhoudini does not work on Redroid according to redroid-script |
+| Graphics | `redroid_gpu_mode=guest` (software rendering) | No hardware acceleration needed |
+| Default version | 14.0.0 | Recent, and the newest version the Magisk setup is known to work on. Translation is best proven on 11, so 14 needs to be checked first. |
+| Root over adb | `ro.secure=0` boot property | Built into Redroid |
+| Root for apps | Bootless Magisk (ayasa520 fork, v30.7), started from `bootanim.rc` | Redroid has no boot image to patch. Magisk's Superuser list gives per-app grants. |
+| Not KernelSU | | Requires a modified host kernel, because every container shares that kernel |
+| Snapshots | btrfs read-only subvolume snapshots; otherwise `tar --xattrs --numeric-owner` + zstd | Keeps UIDs and SELinux labels |
+| Per-app backups | Host side over root adb | Works on any version and needs no app inside Android |
+
+## Known caveats
+
+- Zygisk (Magisk's in-process hooks) can break libndk for 32-bit ARM apps. Leave it off unless a module needs it.
+- microG needs signature spoofing. The runtime route (LSPosed) needs Zygisk, which conflicts with the caveat above. The preferred route is therefore an image with signature spoofing built in.
+- `bootanim.stock.rc` uses `task_profiles`, so Magisk images require Android 11 or newer.
+
+## Next
+
+1. Boot test on the real host: Android 14 image, Magisk active, an arm64-only app running, `su-allow` working.
+2. Check libndk on 15 and 16.
+3. microG image.

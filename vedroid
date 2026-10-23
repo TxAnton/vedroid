@@ -1,0 +1,554 @@
+#!/usr/bin/env bash
+# vedroid: manage Redroid-based Android instances with root, ARM translation,
+# snapshots and per-app backups.
+# Instance fields (NAME, PORT, ANDROID, ...) come from instance.env via load_inst.
+# shellcheck disable=SC2153
+set -euo pipefail
+
+VEDROID_HOME="${VEDROID_HOME:-/srv/vedroid}"
+VEDROID_ENGINE="${VEDROID_ENGINE:-docker}"
+VEDROID_SRC="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+DEFAULT_ANDROID="14.0.0"
+BASE_PORT=5555
+
+die()  { echo "vedroid: $*" >&2; exit 1; }
+info() { echo "==> $*" >&2; }
+
+usage() {
+  cat <<'EOF'
+Usage: vedroid <command> [args]
+
+Host
+  host-check                     Check kernel modules, container engine, filesystem
+  host-setup                     Load binder modules and create the data root (needs root)
+
+Images
+  build-image [--android VER] [--no-magisk]
+                                 Build vedroid/android:<VER>[-magisk] on top of redroid/redroid
+
+Instances
+  create <name> [--android VER] [--no-magisk] [--port N] [--size WxH] [--dpi N]
+  start <name> | stop <name> | restart <name>
+  rm <name> [--keep-data]
+  list
+  shell <name>                   Root adb shell
+  adb <name> <adb args...>       Run adb against the instance
+  view <name> [scrcpy args...]   Open the screen with scrcpy
+  install <name> <apk>...        Install APK(s); several files = one split app
+
+Root inside Android (Magisk)
+  su-allow <name> <package>      Grant root to an app without the Magisk prompt
+  su-deny <name> <package>       Revoke it
+  su-list <name>                 Show apps with a root policy
+
+Backups
+  snapshot <name> [label]        Full snapshot of the instance (stops it briefly)
+  snapshots <name>               List snapshots
+  restore <name> <snapshot>      Roll the instance back to a snapshot
+  backup-app <name> <package> [dir]
+                                 APKs + app data to <dir> (default: $VEDROID_HOME/app-backups)
+  restore-app <name> <backup-dir>
+                                 Restore an app backup, into any instance or version
+
+Environment: VEDROID_HOME (default /srv/vedroid), VEDROID_ENGINE (docker|podman)
+EOF
+}
+
+# ---------------------------------------------------------------- helpers
+
+engine() { "$VEDROID_ENGINE" "$@"; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "missing '$1' ($2)"; }
+
+inst_dir()  { echo "$VEDROID_HOME/instances/$1"; }
+inst_conf() { echo "$(inst_dir "$1")/instance.env"; }
+cname()     { echo "vedroid-$1"; }
+
+valid_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "bad instance name '$1' (use a-z 0-9 _ -)"; }
+
+load_inst() {
+  valid_name "$1"
+  local conf; conf="$(inst_conf "$1")"
+  [[ -f "$conf" ]] || die "no instance '$1'"
+  # shellcheck disable=SC1090
+  source "$conf"
+}
+
+normalize_version() {
+  case "$1" in
+    *.*.*) echo "$1" ;;
+    *.*)   echo "$1.0" ;;
+    *)     echo "$1.0.0" ;;
+  esac
+}
+
+image_tag() { # <android> <magisk:0|1>
+  if [[ "$2" == 1 ]]; then echo "vedroid/android:$1-magisk"; else echo "vedroid/android:$1"; fi
+}
+
+next_port() {
+  local p=$BASE_PORT used
+  used="$(cat "$VEDROID_HOME"/instances/*/instance.env 2>/dev/null | sed -n 's/^PORT=//p')"
+  while grep -qx "$p" <<<"$used"; do p=$((p + 1)); done
+  echo "$p"
+}
+
+is_btrfs() { [[ "$(stat -f -c %T "$1" 2>/dev/null)" == btrfs ]]; }
+
+running() { [[ "$(engine inspect -f '{{.State.Running}}' "$(cname "$1")" 2>/dev/null)" == true ]]; }
+
+serial() { echo "127.0.0.1:$PORT"; }
+
+adb_i() { # run adb against the loaded instance
+  adb -s "$(serial)" "$@"
+}
+
+wait_boot() {
+  need adb "install android-tools / platform-tools"
+  info "waiting for $NAME to boot"
+  for _ in $(seq 1 120); do
+    adb connect "$(serial)" >/dev/null 2>&1 || true
+    if [[ "$(adb_i shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == 1 ]]; then
+      adb_i root >/dev/null 2>&1 || true
+      sleep 1
+      adb connect "$(serial)" >/dev/null 2>&1 || true
+      return 0
+    fi
+    sleep 2
+  done
+  die "$NAME did not finish booting; check '$VEDROID_ENGINE logs $(cname "$NAME")' and 'dmesg -T'"
+}
+
+rsh() { # root shell command on the loaded instance
+  adb_i shell "$@"
+}
+
+# ---------------------------------------------------------------- host
+
+cmd_host_check() {
+  local ok=1
+  if grep -qw binder /proc/filesystems || [[ -e /dev/binderfs || -e /dev/binder ]]; then
+    echo "binder:   ok"
+  else
+    echo "binder:   MISSING (modprobe binder_linux devices=binder,hwbinder,vndbinder)"; ok=0
+  fi
+  if lsmod 2>/dev/null | grep -q ashmem_linux; then
+    echo "ashmem:   ok"
+  else
+    echo "ashmem:   not loaded (fine, vedroid uses memfd)"
+  fi
+  if command -v "$VEDROID_ENGINE" >/dev/null; then echo "engine:   $VEDROID_ENGINE ok"; else echo "engine:   $VEDROID_ENGINE MISSING"; ok=0; fi
+  for t in adb scrcpy zstd; do
+    if command -v "$t" >/dev/null; then echo "$t: ok"; else echo "$t: missing (optional for some commands)"; fi
+  done
+  mkdir -p "$VEDROID_HOME" 2>/dev/null || true
+  if is_btrfs "$VEDROID_HOME"; then echo "storage:  btrfs (instant snapshots)"; else echo "storage:  $(stat -f -c %T "$VEDROID_HOME" 2>/dev/null || echo '?') (snapshots use tar)"; fi
+  echo "cpu:      $(uname -m)"
+  [[ $ok == 1 ]] || exit 1
+}
+
+cmd_host_setup() {
+  [[ $EUID -eq 0 ]] || die "host-setup needs root"
+  modprobe binder_linux devices="binder,hwbinder,vndbinder" || die "cannot load binder_linux; install your distro's extra kernel modules (e.g. linux-modules-extra-$(uname -r))"
+  modprobe ashmem_linux 2>/dev/null || true
+  mkdir -p "$VEDROID_HOME/instances" "$VEDROID_HOME/app-backups"
+  cat > /etc/modules-load.d/vedroid.conf <<'EOF'
+binder_linux
+EOF
+  echo 'options binder_linux devices=binder,hwbinder,vndbinder' > /etc/modprobe.d/vedroid.conf
+  info "binder loaded and set to load at boot; data root is $VEDROID_HOME"
+}
+
+# ---------------------------------------------------------------- images
+
+cmd_build_image() {
+  local android="$DEFAULT_ANDROID" magisk=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --android) android="$(normalize_version "$2")"; shift 2 ;;
+      --no-magisk) magisk=0; shift ;;
+      *) die "build-image: unknown option $1" ;;
+    esac
+  done
+  local tag; tag="$(image_tag "$android" "$magisk")"
+  local ctx; ctx="$(mktemp -d)"
+  echo "FROM redroid/redroid:${android}-latest" > "$ctx/Dockerfile"
+  if [[ $magisk == 1 ]]; then
+    "$VEDROID_SRC/images/magisk/prepare.sh" "$ctx/magisk"
+    echo "COPY magisk /" >> "$ctx/Dockerfile"
+  fi
+  info "building $tag"
+  engine build --pull -t "$tag" "$ctx" || { rm -rf "$ctx"; die "image build failed"; }
+  rm -rf "$ctx"
+}
+
+ensure_image() { # <android> <magisk>
+  local tag; tag="$(image_tag "$1" "$2")"
+  engine image inspect "$tag" >/dev/null 2>&1 && return 0
+  if [[ $2 == 1 ]]; then cmd_build_image --android "$1"; else cmd_build_image --android "$1" --no-magisk; fi
+}
+
+# ---------------------------------------------------------------- instances
+
+cmd_create() {
+  [[ $# -ge 1 ]] || die "create <name> [options]"
+  local name="$1"; shift
+  valid_name "$name"
+  local android="$DEFAULT_ANDROID" magisk=1 port="" size="1080x1920" dpi=420
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --android) android="$(normalize_version "$2")"; shift 2 ;;
+      --no-magisk) magisk=0; shift ;;
+      --port) port="$2"; shift 2 ;;
+      --size) size="$2"; shift 2 ;;
+      --dpi) dpi="$2"; shift 2 ;;
+      *) die "create: unknown option $1" ;;
+    esac
+  done
+  [[ "$size" =~ ^[0-9]+x[0-9]+$ ]] || die "--size must look like 1080x1920"
+  local dir; dir="$(inst_dir "$name")"
+  [[ -e "$dir" ]] && die "instance '$name' already exists"
+  mkdir -p "$VEDROID_HOME/instances"
+  [[ -n "$port" ]] || port="$(next_port)"
+
+  ensure_image "$android" "$magisk"
+
+  mkdir -p "$dir"
+  if is_btrfs "$VEDROID_HOME"; then
+    btrfs subvolume create "$dir/data" >/dev/null
+  else
+    mkdir -p "$dir/data"
+  fi
+  mkdir -p "$dir/snapshots"
+  cat > "$(inst_conf "$name")" <<EOF
+NAME=$name
+ANDROID=$android
+MAGISK=$magisk
+IMAGE=$(image_tag "$android" "$magisk")
+PORT=$port
+WIDTH=${size%x*}
+HEIGHT=${size#*x}
+DPI=$dpi
+CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+  info "created $name (Android $android, adb on 127.0.0.1:$port)"
+  cmd_start "$name"
+}
+
+run_container() {
+  # Software rendering (no GPU needed), memfd instead of ashmem, root adb.
+  # adb is bound to localhost only: an exposed adb port is root on the instance.
+  engine run -d --privileged \
+    --name "$(cname "$NAME")" \
+    --hostname "$NAME" \
+    -v "$(inst_dir "$NAME")/data:/data" \
+    -p "127.0.0.1:$PORT:5555" \
+    "$IMAGE" \
+    androidboot.redroid_width="$WIDTH" \
+    androidboot.redroid_height="$HEIGHT" \
+    androidboot.redroid_dpi="$DPI" \
+    androidboot.redroid_gpu_mode=guest \
+    androidboot.use_memfd=true \
+    ro.secure=0 >/dev/null
+}
+
+cmd_start() {
+  load_inst "${1:?start <name>}"
+  if running "$NAME"; then info "$NAME is already running"; return 0; fi
+  if engine inspect "$(cname "$NAME")" >/dev/null 2>&1; then
+    engine start "$(cname "$NAME")" >/dev/null
+  else
+    run_container
+  fi
+  wait_boot
+  info "$NAME is up: adb -s $(serial) shell   or   vedroid view $NAME"
+}
+
+cmd_stop() {
+  load_inst "${1:?stop <name>}"
+  running "$NAME" || { info "$NAME is not running"; return 0; }
+  adb disconnect "$(serial)" >/dev/null 2>&1 || true
+  engine stop -t 30 "$(cname "$NAME")" >/dev/null
+  info "stopped $NAME"
+}
+
+cmd_restart() { cmd_stop "$1"; cmd_start "$1"; }
+
+cmd_rm() {
+  load_inst "${1:?rm <name>}"
+  local keep=0; [[ "${2:-}" == --keep-data ]] && keep=1
+  engine rm -f "$(cname "$NAME")" >/dev/null 2>&1 || true
+  if [[ $keep == 1 ]]; then
+    info "removed container; data kept in $(inst_dir "$NAME")"
+    return 0
+  fi
+  local dir; dir="$(inst_dir "$NAME")"
+  if is_btrfs "$dir"; then
+    local s
+    for s in "$dir"/snapshots/*/ "$dir/data"; do
+      [[ -d "$s" ]] && btrfs subvolume delete "$s" >/dev/null 2>&1 || true
+    done
+  fi
+  rm -rf "$dir"
+  info "removed $NAME and its data"
+}
+
+cmd_list() {
+  printf '%-16s %-9s %-7s %-7s %s\n' NAME ANDROID MAGISK STATE ADB
+  local conf
+  for conf in "$VEDROID_HOME"/instances/*/instance.env; do
+    [[ -f "$conf" ]] || continue
+    (
+      # shellcheck disable=SC1090
+      source "$conf"
+      local state=stopped
+      running "$NAME" && state=running
+      printf '%-16s %-9s %-7s %-7s %s\n' "$NAME" "$ANDROID" "$([[ $MAGISK == 1 ]] && echo yes || echo no)" "$state" "127.0.0.1:$PORT"
+    )
+  done
+}
+
+cmd_shell() { load_inst "${1:?shell <name>}"; shift; adb connect "$(serial)" >/dev/null; adb_i shell "$@"; }
+cmd_adb()   { load_inst "${1:?adb <name> ...}"; shift; adb connect "$(serial)" >/dev/null; adb_i "$@"; }
+
+cmd_view() {
+  load_inst "${1:?view <name>}"; shift
+  need scrcpy "https://github.com/Genymobile/scrcpy"
+  adb connect "$(serial)" >/dev/null
+  scrcpy -s "$(serial)" --window-title "vedroid: $NAME (Android $ANDROID)" "$@"
+}
+
+cmd_install() {
+  load_inst "${1:?install <name> <apk>...}"; shift
+  [[ $# -ge 1 ]] || die "install <name> <apk>..."
+  adb connect "$(serial)" >/dev/null
+  if [[ $# -eq 1 ]]; then adb_i install -r "$1"; else adb_i install-multiple -r "$@"; fi
+}
+
+# ---------------------------------------------------------------- root (Magisk)
+
+pkg_uid() { # <package> -> app uid, from the loaded instance
+  local uid
+  uid="$(rsh "pm list packages -U $1" | tr -d '\r' | sed -n "s/^package:$1 uid:\([0-9]*\).*/\1/p" | head -n1)"
+  [[ -n "$uid" ]] || die "package '$1' is not installed in $NAME"
+  echo "$uid"
+}
+
+magisk_sql() { rsh "magisk --sqlite \"$1\""; }
+
+require_magisk() {
+  [[ "$MAGISK" == 1 ]] || die "$NAME was created with --no-magisk"
+  running "$NAME" || die "$NAME is not running"
+  adb connect "$(serial)" >/dev/null
+  rsh "command -v magisk >/dev/null" || die "magisk is not active in $NAME yet; open the Magisk app once to finish setup"
+}
+
+cmd_su_allow() {
+  load_inst "${1:?su-allow <name> <package>}"; local pkg="${2:?su-allow <name> <package>}"
+  require_magisk
+  local uid; uid="$(pkg_uid "$pkg")"
+  # policy 2 = allow, until 0 = forever
+  magisk_sql "REPLACE INTO policies (uid,policy,until,logging,notification) VALUES($uid,2,0,1,1)"
+  info "$pkg (uid $uid) now has root in $NAME"
+}
+
+cmd_su_deny() {
+  load_inst "${1:?su-deny <name> <package>}"; local pkg="${2:?su-deny <name> <package>}"
+  require_magisk
+  local uid; uid="$(pkg_uid "$pkg")"
+  magisk_sql "REPLACE INTO policies (uid,policy,until,logging,notification) VALUES($uid,1,0,1,1)"
+  info "$pkg (uid $uid) is denied root in $NAME"
+}
+
+cmd_su_list() {
+  load_inst "${1:?su-list <name>}"
+  require_magisk
+  local rows; rows="$(magisk_sql "SELECT uid,policy FROM policies" | tr -d '\r')"
+  local pkgs; pkgs="$(rsh "pm list packages -U" | tr -d '\r')"
+  local line uid policy pkg
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    uid="$(sed -n 's/.*uid=\([0-9]*\).*/\1/p' <<<"$line")"
+    policy="$(sed -n 's/.*policy=\([0-9]*\).*/\1/p' <<<"$line")"
+    pkg="$(awk -v u="uid:$uid" '$2==u {sub("package:","",$1); print $1}' <<<"$pkgs" | paste -sd, -)"
+    printf '%-40s %s\n' "${pkg:-uid $uid}" "$([[ $policy == 2 ]] && echo allow || echo deny)"
+  done <<<"$rows"
+}
+
+# ---------------------------------------------------------------- snapshots
+
+cmd_snapshot() {
+  load_inst "${1:?snapshot <name> [label]}"
+  local label="${2:-}" ts; ts="$(date -u +%Y%m%d-%H%M%S)"
+  local id="$ts${label:+-$label}"
+  [[ "$id" =~ ^[A-Za-z0-9_.-]+$ ]] || die "label may only use letters, digits, . _ -"
+  local dir; dir="$(inst_dir "$NAME")"
+  local was_running=0
+  running "$NAME" && { was_running=1; cmd_stop "$NAME"; }
+  mkdir -p "$dir/snapshots"
+  if is_btrfs "$dir/data" && btrfs subvolume show "$dir/data" >/dev/null 2>&1; then
+    btrfs subvolume snapshot -r "$dir/data" "$dir/snapshots/$id" >/dev/null
+  else
+    need zstd "install zstd"
+    mkdir -p "$dir/snapshots/$id"
+    # --xattrs keeps SELinux labels; --numeric-owner keeps Android uids
+    tar --numeric-owner --xattrs --xattrs-include='*' --acls -C "$dir/data" -cf - . \
+      | zstd -q -T0 -o "$dir/snapshots/$id/data.tar.zst"
+  fi
+  cp "$(inst_conf "$NAME")" "$dir/snapshots/$id.env"
+  [[ $was_running == 1 ]] && cmd_start "$NAME"
+  info "snapshot $id of $NAME saved"
+}
+
+cmd_snapshots() {
+  load_inst "${1:?snapshots <name>}"
+  local f
+  for f in "$(inst_dir "$NAME")"/snapshots/*.env; do
+    [[ -f "$f" ]] || continue
+    printf '%s  (Android %s)\n' "$(basename "$f" .env)" "$(sed -n 's/^ANDROID=//p' "$f")"
+  done
+}
+
+cmd_restore() {
+  load_inst "${1:?restore <name> <snapshot>}"; local id="${2:?restore <name> <snapshot>}"
+  local dir; dir="$(inst_dir "$NAME")"
+  local snap="$dir/snapshots/$id"
+  [[ -e "$snap" && -f "$snap.env" ]] || die "no snapshot '$id' for $NAME"
+  cmd_stop "$NAME"
+  # The snapshot remembers which image it ran on; restore that too.
+  engine rm -f "$(cname "$NAME")" >/dev/null 2>&1 || true
+  local old
+  old="$dir/data.before-restore-$(date -u +%Y%m%d-%H%M%S)"
+  mv "$dir/data" "$old"
+  if [[ -f "$snap/data.tar.zst" ]]; then
+    mkdir -p "$dir/data"
+    zstd -dc "$snap/data.tar.zst" | tar --numeric-owner --xattrs --xattrs-include='*' --acls -C "$dir/data" -xf -
+  else
+    btrfs subvolume snapshot "$snap" "$dir/data" >/dev/null
+  fi
+  cp "$snap.env" "$(inst_conf "$NAME")"
+  info "restored $NAME to $id; previous data kept at $old (delete it when happy)"
+  cmd_start "$NAME"
+}
+
+# ---------------------------------------------------------------- per-app backups
+
+cmd_backup_app() {
+  load_inst "${1:?backup-app <name> <package> [dir]}"
+  local pkg="${2:?backup-app <name> <package> [dir]}"
+  local root="${3:-$VEDROID_HOME/app-backups}"
+  running "$NAME" || die "$NAME must be running"
+  adb connect "$(serial)" >/dev/null
+  adb_i root >/dev/null 2>&1 || true
+  pkg_uid "$pkg" >/dev/null
+  local out; out="$root/$pkg/$(date -u +%Y%m%d-%H%M%S)-$NAME"
+  mkdir -p "$out/apk"
+
+  info "saving APKs of $pkg"
+  local p
+  while IFS= read -r p; do
+    p="${p#package:}"; [[ -n "$p" ]] || continue
+    adb_i pull "$p" "$out/apk/" >/dev/null
+  done < <(rsh "pm path $pkg" | tr -d '\r')
+
+  info "saving data of $pkg"
+  rsh "am force-stop $pkg"
+  # Internal data, device-protected data, and app-specific external storage.
+  local parts=( "data/data/$pkg" "data/user_de/0/$pkg" "data/media/0/Android/data/$pkg" "data/media/0/Android/obb/$pkg" )
+  local present=() part
+  for part in "${parts[@]}"; do
+    rsh "[ -e /$part ]" && present+=( "$part" )
+  done
+  local excl=""
+  for part in "data/data/$pkg" "data/user_de/0/$pkg"; do
+    excl+=" --exclude=$part/cache --exclude=$part/code_cache --exclude=$part/lib"
+  done
+  adb_i exec-out "tar -cf - -C /$excl ${present[*]}" | zstd -q -T0 -o "$out/data.tar.zst"
+
+  cat > "$out/meta.env" <<EOF
+PACKAGE=$pkg
+SOURCE_INSTANCE=$NAME
+SOURCE_ANDROID=$ANDROID
+VERSION=$(rsh "dumpsys package $pkg" | tr -d '\r' | sed -n 's/^ *versionName=//p' | head -n1)
+CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+  info "backup written to $out"
+}
+
+cmd_restore_app() {
+  load_inst "${1:?restore-app <name> <backup-dir>}"
+  local src="${2:?restore-app <name> <backup-dir>}"
+  [[ -f "$src/meta.env" && -f "$src/data.tar.zst" ]] || die "'$src' is not an app backup"
+  local PACKAGE; PACKAGE="$(sed -n 's/^PACKAGE=//p' "$src/meta.env")"
+  running "$NAME" || die "$NAME must be running"
+  adb connect "$(serial)" >/dev/null
+  adb_i root >/dev/null 2>&1 || true
+
+  info "installing $PACKAGE"
+  local apks=( "$src"/apk/*.apk )
+  if [[ ${#apks[@]} -eq 1 ]]; then adb_i install -r "${apks[0]}"; else adb_i install-multiple -r "${apks[@]}"; fi
+  local uid; uid="$(pkg_uid "$PACKAGE")"
+  # cache dirs use the app's cache gid: 20000 + appId (appId = uid % 100000 - 10000)
+  local appid=$(( uid % 100000 - 10000 ))
+  local cachegid=$(( uid / 100000 * 100000 + 20000 + appid ))
+
+  info "restoring data of $PACKAGE (uid $uid)"
+  rsh "am force-stop $PACKAGE"
+  zstd -dc "$src/data.tar.zst" > "$src/.restore.tar"
+  adb_i push "$src/.restore.tar" /data/local/tmp/vedroid-restore.tar >/dev/null
+  rm -f "$src/.restore.tar"
+  rsh "
+    set -e
+    for d in /data/data/$PACKAGE /data/user_de/0/$PACKAGE; do
+      [ -d \$d ] && find \$d -mindepth 1 -maxdepth 1 ! -name lib -exec rm -rf {} +
+    done
+    tar -xf /data/local/tmp/vedroid-restore.tar -C /
+    rm -f /data/local/tmp/vedroid-restore.tar
+    for d in /data/data/$PACKAGE /data/user_de/0/$PACKAGE; do
+      [ -d \$d ] || continue
+      chown -R $uid:$uid \$d
+      for c in cache code_cache; do
+        mkdir -p \$d/\$c && chown -R $uid:$cachegid \$d/\$c && chmod 2771 \$d/\$c
+      done
+    done
+    for d in /data/media/0/Android/data/$PACKAGE /data/media/0/Android/obb/$PACKAGE; do
+      [ -d \$d ] && chown -R $uid:1078 \$d
+    done
+    restorecon -RF /data/data/$PACKAGE /data/user_de/0/$PACKAGE 2>/dev/null || true
+    [ -d /data/media/0/Android/data/$PACKAGE ] && restorecon -RF /data/media/0/Android/data/$PACKAGE 2>/dev/null || true
+  "
+  info "restored $PACKAGE into $NAME"
+}
+
+# ---------------------------------------------------------------- main
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    host-check)  cmd_host_check "$@" ;;
+    host-setup)  cmd_host_setup "$@" ;;
+    build-image) cmd_build_image "$@" ;;
+    create)      cmd_create "$@" ;;
+    start)       cmd_start "$@" ;;
+    stop)        cmd_stop "$@" ;;
+    restart)     cmd_restart "$@" ;;
+    rm)          cmd_rm "$@" ;;
+    list|ls)     cmd_list "$@" ;;
+    shell)       cmd_shell "$@" ;;
+    adb)         cmd_adb "$@" ;;
+    view)        cmd_view "$@" ;;
+    install)     cmd_install "$@" ;;
+    su-allow)    cmd_su_allow "$@" ;;
+    su-deny)     cmd_su_deny "$@" ;;
+    su-list)     cmd_su_list "$@" ;;
+    snapshot)    cmd_snapshot "$@" ;;
+    snapshots)   cmd_snapshots "$@" ;;
+    restore)     cmd_restore "$@" ;;
+    backup-app)  cmd_backup_app "$@" ;;
+    restore-app) cmd_restore_app "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
