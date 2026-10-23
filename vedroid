@@ -55,6 +55,7 @@ Instances
   adb <name> <adb args...>       Run adb against the instance
   view <name> [scrcpy args...]   Open the screen with scrcpy
   install <name> <apk>...        Install APK(s); several files = one split app
+  microg <name>                  microG + LSPosed/Vector + FakeGApps (needs Magisk; re-runnable)
 
 Root inside Android (Magisk)
   su-allow <name> <package>      Grant root to an app without the Magisk prompt
@@ -663,6 +664,139 @@ cmd_restore_app() {
   info "restored $PACKAGE into $NAME"
 }
 
+# ---------------------------------------------------------------- microG
+
+# Pinned downloads: <file> <sha256> <url>. Hashes come from the publishers'
+# indexes (microG's F-Droid repo, IzzyOnDroid, GitHub release digests), never
+# from a first fetch.
+MICROG_FILES=(
+  "Vector-v2.2-3080-Release.zip 9ee8323575d615f7b3f1076ff60b2a63a49390ef11881b52632311a37f6f79cc https://github.com/JingMatrix/Vector/releases/download/v2.2/Vector-v2.2-3080-Release.zip"
+  "com.google.android.gms-252432034.apk e5e6cba078bdec812b5450599350e5c1a12c8b7438da5bf77123af170f8c1a35 https://microg.org/fdroid/repo/com.google.android.gms-252432034.apk"
+  "com.android.vending-84022634.apk 9b8616011cc8f026bcbbe094df850794abb9d6d9f23214d7a8f8c4d1033ea012 https://microg.org/fdroid/repo/com.android.vending-84022634.apk"
+  "inc.whew.android.fakegapps_13.apk a74256c6a6fc15ed041dad76054b81bb74c4b6751e587dc88f9c959332f02446 https://apt.izzysoft.de/fdroid/repo/inc.whew.android.fakegapps_13.apk"
+)
+MICROG_MODULE=vedroid-microg
+MICROG_VERSION=252432034
+FAKEGAPPS_PKG=inc.whew.android.fakegapps
+# Privileged permissions microG requests (checked against Android 14's
+# protection levels). Redroid does not enforce the allowlist, but ROMs that do
+# refuse to boot without it.
+GMS_PRIV_PERMS="CHANGE_DEVICE_IDLE_TEMP_WHITELIST DUMP INSTALL_LOCATION_PROVIDER INTERACT_ACROSS_USERS LOCATION_HARDWARE MANAGE_USB MODIFY_PHONE_STATE NETWORK_SCAN PROVIDE_DEFAULT_ENABLED_CREDENTIAL_SERVICE PROVIDE_REMOTE_CREDENTIALS START_ACTIVITIES_FROM_BACKGROUND UPDATE_APP_OPS_STATS UPDATE_DEVICE_STATS WATCH_APPOPS"
+VENDING_PRIV_PERMS="DELETE_PACKAGES INSTALL_PACKAGES INTERACT_ACROSS_USERS"
+
+fetch() { # <file> <sha256> <url> -> path in the cache, verified
+  local cache="${VEDROID_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/vedroid}" f="$1" sum="$2" url="$3"
+  mkdir -p "$cache"
+  if ! echo "$sum  $cache/$f" | sha256sum -c --status 2>/dev/null; then
+    info "downloading $f"
+    curl -fsSL -o "$cache/$f.part" "$url" || die "download failed: $url"
+    echo "$sum  $cache/$f.part" | sha256sum -c --status || { rm -f "$cache/$f.part"; die "checksum mismatch for $f"; }
+    mv "$cache/$f.part" "$cache/$f"
+  fi
+  echo "$cache/$f"
+}
+
+microg_module() { # <outdir> <gms.apk> <vending.apk>: systemless priv-app module
+  local out="$1" gms="$2" vending="$3" app p
+  mkdir -p "$out/system/etc/permissions"
+  printf 'id=%s\nname=microG (vedroid)\nversion=%s\nversionCode=%s\nauthor=vedroid\ndescription=microG Services and Companion as privileged system apps\n' \
+    "$MICROG_MODULE" "$MICROG_VERSION" "$MICROG_VERSION" > "$out/module.prop"
+  for app in "GmsCore:$gms" "Phonesky:$vending"; do
+    local name="${app%%:*}" apk="${app#*:}"
+    mkdir -p "$out/system/priv-app/$name"
+    cp "$apk" "$out/system/priv-app/$name/$name.apk"
+    # System apps get no native lib extraction; ship them next to the APK.
+    if unzip -l "$apk" 'lib/x86_64/*' >/dev/null 2>&1; then
+      mkdir -p "$out/system/priv-app/$name/lib/x86_64"
+      unzip -q -o -j "$apk" 'lib/x86_64/*' -d "$out/system/priv-app/$name/lib/x86_64"
+    fi
+  done
+  {
+    echo '<?xml version="1.0" encoding="utf-8"?>'
+    echo '<permissions>'
+    echo '    <privapp-permissions package="com.google.android.gms">'
+    for p in $GMS_PRIV_PERMS; do echo "        <permission name=\"android.permission.$p\"/>"; done
+    echo '    </privapp-permissions>'
+    echo '    <privapp-permissions package="com.android.vending">'
+    for p in $VENDING_PRIV_PERMS; do echo "        <permission name=\"android.permission.$p\"/>"; done
+    echo '    </privapp-permissions>'
+    echo '</permissions>'
+  } > "$out/system/etc/permissions/privapp-permissions-vedroid-microg.xml"
+  find "$out" -type d -exec chmod 0755 {} +; find "$out" -type f -exec chmod 0644 {} +
+}
+
+cmd_microg() {
+  load_inst "${1:?microg <name>}"
+  require_magisk
+  need curl "install curl"; need unzip "install unzip"
+  ensure_helper
+  local f files=()
+  for f in "${MICROG_FILES[@]}"; do
+    # shellcheck disable=SC2086
+    files+=( "$(fetch $f)" )
+  done
+  local vector="${files[0]}" gms="${files[1]}" vending="${files[2]}" fakegapps="${files[3]}"
+  local changed=0
+
+  # 1. Zygisk (LSPosed/Vector runs as a Zygisk module).
+  if [[ "$(magisk_sql "SELECT value FROM settings WHERE key='zygisk'" | tr -d '\r')" != "value=1" ]]; then
+    magisk_sql "REPLACE INTO settings (key,value) VALUES('zygisk',1)" >/dev/null
+    info "enabled Zygisk"; changed=1
+  fi
+
+  # 2. LSPosed/Vector as a Magisk module.
+  local vid; vid="$(unzip -p "$vector" module.prop | tr -d '\r' | sed -n 's/^id=//p')"
+  [[ -n "$vid" ]] || die "no module id in $vector"
+  if ! rsh "[ -d /data/adb/modules/$vid ] || [ -d /data/adb/modules_update/$vid ]"; then
+    info "installing $(basename "$vector") (module $vid)"
+    adb_i push "$vector" /data/local/tmp/vedroid-vector.zip >/dev/null
+    rsh "$MAGISK_BIN --install-module /data/local/tmp/vedroid-vector.zip; r=\$?; rm -f /data/local/tmp/vedroid-vector.zip; exit \$r" \
+      || die "installing $vid failed"
+    changed=1
+  fi
+
+  # 3. microG Services + Companion as privileged system apps (systemless).
+  if [[ "$(rsh "sed -n 's/^versionCode=//p' /data/adb/modules/$MICROG_MODULE/module.prop 2>/dev/null" | tr -d '\r')" != "$MICROG_VERSION" ]]; then
+    if rsh "pm path com.google.android.gms; pm path com.android.vending" 2>/dev/null | grep -q '/data/app/'; then
+      die "a user-installed com.google.android.gms or com.android.vending is present; uninstall it first"
+    fi
+    local tmp; tmp="$(mktemp -d)"
+    microg_module "$tmp/$MICROG_MODULE" "$gms" "$vending"
+    info "installing Magisk module $MICROG_MODULE (microG $MICROG_VERSION)"
+    tar -C "$tmp" -cf "$tmp/module.tar" "$MICROG_MODULE"
+    adb_i push "$tmp/module.tar" /data/local/tmp/vedroid-microg.tar >/dev/null \
+      && rsh "rm -rf /data/adb/modules/$MICROG_MODULE && tar -xf /data/local/tmp/vedroid-microg.tar -C /data/adb/modules \
+              && chown -R 0:0 /data/adb/modules/$MICROG_MODULE; r=\$?; rm -f /data/local/tmp/vedroid-microg.tar; exit \$r" \
+      && rsh "[ -f /data/adb/modules/$MICROG_MODULE/module.prop ]" \
+      || { rm -rf "$tmp"; die "pushing the microG module failed"; }
+    rm -rf "$tmp"
+    changed=1
+  fi
+
+  # 4. FakeGApps (the LSPosed module that spoofs signatures for microG).
+  if ! rsh "pm list packages $FAKEGAPPS_PKG" | tr -d '\r' | grep -qx "package:$FAKEGAPPS_PKG"; then
+    info "installing FakeGApps"
+    adb_i install -r "$fakegapps" >/dev/null || die "installing FakeGApps failed"
+    changed=1
+  fi
+
+  # 5. Reboot so Zygisk, Vector and the system apps load, then enable FakeGApps
+  #    for the framework ("system"), microG and the Companion with Vector's CLI,
+  #    and reboot again so the hooks are in place from system_server onwards.
+  if [[ $changed == 1 ]]; then cmd_restart "$NAME"; fi
+  local cli=/data/adb/lspd/cli
+  rsh "[ -x $cli ]" || die "Vector did not start (no $cli); check '$VEDROID_ENGINE logs $(cname "$NAME")'"
+  local scope="system/0 com.google.android.gms/0 com.android.vending/0"
+  if ! rsh "$cli modules ls" | tr -d '\r' | grep -q "^$FAKEGAPPS_PKG .* enabled" \
+     || [[ "$(rsh "$cli scope ls $FAKEGAPPS_PKG" | tr -d '\r' | awk 'NR>2 {print $1"/"$2}' | sort | xargs)" != "$(tr ' ' '\n' <<<"$scope" | sort | xargs)" ]]; then
+    rsh "$cli modules enable $FAKEGAPPS_PKG && $cli scope set $FAKEGAPPS_PKG $scope" >/dev/null \
+      || die "could not enable FakeGApps in Vector"
+    info "enabled FakeGApps in Vector (scope: $scope)"
+    cmd_restart "$NAME"
+  fi
+  info "microG is set up in $NAME; open microG Settings > Self-Check to verify signature spoofing"
+}
+
 # ---------------------------------------------------------------- main
 
 main() {
@@ -690,6 +824,7 @@ main() {
     restore)     cmd_restore "$@" ;;
     backup-app)  cmd_backup_app "$@" ;;
     restore-app) cmd_restore_app "$@" ;;
+    microg)      cmd_microg "$@" ;;
     help|-h|--help) usage ;;
     *) usage >&2; exit 2 ;;
   esac

@@ -23,7 +23,9 @@ The full write-up is the "Vedroid: Android container design" doc. This file keep
 
 - The Redroid 14 x86_64 image has 64-bit `libndk_translation` only (`/system/lib/libnb.so` dangles; 32-bit zygote logs "Failed to load native bridge"). armeabi-v7a apps are not supported there. Android 11/12 images are expected to ship both; verify before relying on it.
 - Zygisk (Magisk's in-process hooks) can break libndk for 32-bit ARM apps. Leave it off unless a module needs it.
-- microG needs signature spoofing. The runtime route (LSPosed) needs Zygisk, which conflicts with the caveat above. The preferred route is therefore an image with signature spoofing built in.
+- microG needs signature spoofing. AOSP 14 has none, so `vedroid microg` uses the runtime route: Zygisk + Vector (LSPosed) v2.2 + FakeGApps 6.6 scoped to `system`, microG and the Companion, configured with Vector's own CLI (`/data/adb/lspd/cli`). Tested on Android 14: Self-Check passes "System spoofs signature" and both "correct signature" checks; arm64 apps (Termux) still run with Zygisk on. Zygisk can break 32-bit libndk, which the 14 image lacks anyway. An image with spoofing built in (Redroid from source with the microG patch) would avoid Zygisk.
+- microG is installed as a Magisk module with `system/priv-app/{GmsCore,Phonesky}`, native libraries pre-extracted, and a privapp-permissions XML. A user-installed copy of either package makes `vedroid microg` stop.
+- `adb exec-in` silently does nothing against Redroid here; push a file and unpack it as root instead.
 - `bootanim.stock.rc` uses `task_profiles`, so Magisk images require Android 11 or newer.
 - Redroid on a non-SELinux host runs with SELinux disabled, so `magiskpolicy --live` is skipped when `/sys/fs/selinux/enforce` is missing.
 - Redroid images are userdebug builds and ship AOSP `/system/xbin/su` (setuid, `root:shell` 4750, syntax `su [uid] [cmd]`). Only the shell user can run it. It is left in place; test Magisk with `/sbin/su` explicitly.
@@ -36,4 +38,4 @@ The full write-up is the "Vedroid: Android container design" doc. This file keep
 
 1. Boot test on the real host. Done on 2026-10-23: Android 14 boots, arm64-v8a native bridge present, Magisk daemon up, grants work via `/sbin/su`. Still to do: an arm64-only app, and an app getting root through `/system/bin/su` after an image rebuild.
 2. Check libndk on 15 and 16, and 32-bit ARM on 11/12.
-3. microG image.
+3. microG built into the image (signature spoofing patch), to drop the Zygisk dependency.

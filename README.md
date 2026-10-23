@@ -5,7 +5,7 @@ Android instances in containers on a Linux PC or VM, built on [Redroid](https://
 - several instances side by side, each on its own Android version (8.1 to 16, default 14)
 - root over adb, plus per-app root inside Android through Magisk
 - ARM64 apps on x86_64 hosts through `libndk_translation` (included in Redroid images). The Android 14 image has no 32-bit translation, so armeabi-v7a-only apps do not run there; Android 11/12 images are expected to ship both (not yet verified)
-- no Google services; microG is planned (see [docs/design.md](docs/design.md))
+- no Google services by default; `vedroid microg` adds microG with signature spoofing (see below)
 - full instance snapshots and per-app backup and restore
 
 Status: early. Android 14 + Magisk boots on an x86_64 host; see [docs/design.md](docs/design.md) for what has been tested.
@@ -70,6 +70,20 @@ Magisk runs from `/sbin` (Magisk 30.6, from the ayasa520 fork's v30.7 release). 
 ```
 
 The Magisk app works as on a phone: Superuser prompts, the Superuser list and Modules. Magisk's own files in `/data/adb/magisk` are set up at boot, so the app never asks for "additional setup". Modules take effect after `./vedroid restart main`.
+
+## microG
+
+```sh
+./vedroid microg main
+```
+
+This installs, from pinned versions checked against published SHA-256 hashes:
+
+- **Vector** (LSPosed, JingMatrix) v2.2 as a Magisk module, with Zygisk turned on
+- **microG Services** and **microG Companion** 0.3.17 as privileged system apps, through a generated Magisk module (`vedroid-microg`)
+- **FakeGApps** 6.6, enabled in Vector for the framework, microG and the Companion, so the system spoofs Google's signature for them
+
+The instance restarts a few times. Running it again only does what is missing. Check the result in microG Settings > Self-Check ("System spoofs signature"). Zygisk stays on afterwards; it can break 32-bit ARM translation, which the Android 14 image does not have anyway.
 
 ## Backups
 
