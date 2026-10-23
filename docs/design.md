@@ -9,7 +9,7 @@ The full write-up is the "Vedroid: Android container design" doc. This file keep
 | Base | Redroid, not Waydroid | Supports several instances at once and Android 8.1 to 16. Waydroid runs one instance per host and ships Android 13 officially. |
 | Host | x86_64 (AMD) Linux PC or VM | The user's hardware |
 | ARM apps | `libndk_translation`, already included in Redroid images | Recommended on AMD; libhoudini does not work on Redroid according to redroid-script |
-| ARM executables | Redroid's `/system/etc/binfmt_misc/*` replaced by copies without the `P` flag (`images/binfmt/`) | With `P`, the translator `realpath()`s a bare argv[0], so programs found via PATH fail. Entries are global on the host; `host-setup --clean-binfmt` clears stale ones |
+| ARM executables | Redroid's `/system/etc/binfmt_misc/*` point at `/system/bin/vedroid-binfmt-arm{,64}` (flag `P` kept), shell wrappers that pass the full path as argv[0] when it is a bare name (`images/binfmt/`) | The ndk_translation runner expects P-style arguments and `realpath()`s argv[0], so programs found via PATH fail with stock entries. Dropping `P` instead breaks every program called with arguments. Entries are global on the host; `recreate` clears stale ones |
 | Graphics | `redroid_gpu_mode=guest` (software rendering) | No hardware acceleration needed |
 | Default version | 14.0.0 | Recent, and the newest version the Magisk setup is known to work on. Translation is best proven on 11, so 14 needs to be checked first. |
 | Root over adb | `ro.secure=0` boot property | Built into Redroid |
@@ -27,6 +27,7 @@ The full write-up is the "Vedroid: Android container design" doc. This file keep
 - `bootanim.stock.rc` uses `task_profiles`, so Magisk images require Android 11 or newer.
 - Redroid on a non-SELinux host runs with SELinux disabled, so `magiskpolicy --live` is skipped when `/sys/fs/selinux/enforce` is missing.
 - Redroid images are userdebug builds and ship AOSP `/system/xbin/su` (setuid, `root:shell` 4750, syntax `su [uid] [cmd]`). Only the shell user can run it. It is left in place; test Magisk with `/sbin/su` explicitly.
+- The ayasa520 APK is signed with the Android debug key, and its daemon rejects it: on the first su request that needs a prompt, magiskd logs "APK signature mismatch" and uninstalls the Magisk app. Grants from the host (`su-allow`) keep working; prompts and the Magisk UI do not.
 - Magisk logs `mount: preinit dir not found`. Root grants work; module mounting is untested.
 
 ## Next

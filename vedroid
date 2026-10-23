@@ -39,7 +39,7 @@ Usage: vedroid <command> [args]
 Host
   host-check                     Check kernel modules, container engine, filesystem
   host-setup                     Load binder modules and create the data root (needs root)
-  host-setup --clean-binfmt      Remove the ARM binfmt_misc entries Redroid registered on the host (needs root)
+  host-setup --clean-binfmt      Remove the ARM binfmt_misc entries Redroid registered on the host
 
 Images
   build-image [--android VER] [--no-magisk]
@@ -181,31 +181,49 @@ cmd_host_check() {
   mkdir -p "$VEDROID_HOME" 2>/dev/null || true
   if is_btrfs "$VEDROID_HOME"; then echo "storage:  btrfs (instant snapshots; needs sudo)"; else echo "storage:  $(fs_type "$VEDROID_HOME") (snapshots use tar)"; fi
   echo "cpu:      $(uname -m)"
-  local e stale=""
-  for e in "${BINFMT_ENTRIES[@]}"; do
-    grep -q '^flags: .*P' "/proc/sys/fs/binfmt_misc/$e" 2>/dev/null && stale+=" $e"
-  done
+  local stale; stale="$(stale_binfmt)"
   if [[ -n "$stale" ]]; then
-    echo "binfmt:   WARNING stale entries with flag P:$stale (arm64 programs run via PATH fail)"
-    echo "          fix: sudo vedroid host-setup --clean-binfmt, then vedroid recreate <name>"
+    echo "binfmt:   WARNING stale entries:$stale (ARM programs started via PATH may fail)"
+    echo "          fix: vedroid recreate <name> (clears them), or vedroid host-setup --clean-binfmt"
   fi
   [[ $ok == 1 ]] || exit 1
 }
 
 BINFMT_ENTRIES=(arm64_exe arm64_dyn arm_exe arm_dyn)
 
+stale_binfmt() { # host entries that do not match images/binfmt/etc (interpreter + P flag)
+  local e want f
+  for e in "${BINFMT_ENTRIES[@]}"; do
+    f="/proc/sys/fs/binfmt_misc/$e"
+    [[ -r "$f" ]] || continue
+    want="$(cut -d: -f7 "$VEDROID_SRC/images/binfmt/etc/$e")"
+    if ! grep -qx "interpreter $want" "$f" || ! grep -q '^flags: .*P' "$f"; then
+      printf ' %s' "$e"
+    fi
+  done
+}
+
+clean_binfmt() {
+  # binfmt_misc is global to the host kernel. Redroid's init registers these on
+  # boot and never replaces an existing entry, so stale ones must go first.
+  # Without root, do it from a privileged helper (docker group is root-equivalent).
+  local script='for e in '"${BINFMT_ENTRIES[*]}"'; do [ -e /proc/sys/fs/binfmt_misc/$e ] && echo -1 > /proc/sys/fs/binfmt_misc/$e && echo "==> removed binfmt entry $e" >&2; done; true'
+  if [[ $EUID -eq 0 ]]; then
+    sh -c "$script"
+  else
+    ensure_helper
+    engine run --rm --privileged --network none --entrypoint /bin/sh "$HELPER_IMAGE" \
+      -c "mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null; $script"
+  fi
+}
+
 cmd_host_setup() {
-  [[ $EUID -eq 0 ]] || die "host-setup needs root"
   if [[ "${1:-}" == --clean-binfmt ]]; then
-    # binfmt_misc is global to the host kernel; Redroid's init registers these on
-    # boot, and an existing entry is never replaced, so stale ones must go first.
-    local e
-    for e in "${BINFMT_ENTRIES[@]}"; do
-      [[ -e /proc/sys/fs/binfmt_misc/$e ]] && echo -1 > "/proc/sys/fs/binfmt_misc/$e" && info "removed binfmt entry $e"
-    done
+    clean_binfmt
     info "binfmt entries cleared; running instances need 'vedroid recreate' (or restart) to register them again"
     return 0
   fi
+  [[ $EUID -eq 0 ]] || die "host-setup needs root"
   [[ $# -eq 0 ]] || die "host-setup: unknown option $1"
   modprobe binder_linux devices="binder,hwbinder,vndbinder" || die "cannot load binder_linux; install your distro's extra kernel modules (e.g. linux-modules-extra-$(uname -r))"
   modprobe ashmem_linux 2>/dev/null || true
@@ -238,16 +256,30 @@ cmd_build_image() {
   local tag; tag="$(image_tag "$android" "$magisk")"
   local ctx; ctx="$(mktemp -d)"
   echo "FROM redroid/redroid:${android}-latest" > "$ctx/Dockerfile"
+  # Files for /system/bin. COPY also applies the source directory's mode and
+  # owner to the existing /system/bin, so match stock: 0751 root:shell.
+  mkdir -p "$ctx/sysbin"
   if [[ "$(uname -m)" == x86_64 ]]; then
-    # Stock entries carry the P flag, which makes the translator realpath() a bare
-    # argv[0]; arm64 programs found through PATH then fail. Same entries, no P.
-    cp -r "$VEDROID_SRC/images/binfmt" "$ctx/binfmt"
-    chmod 0644 "$ctx"/binfmt/*
-    echo "COPY binfmt /system/etc/binfmt_misc/" >> "$ctx/Dockerfile"
+    # ARM executables: the stock binfmt_misc runner realpath()s argv[0], so a
+    # program found through PATH by bare name fails. Register small wrappers
+    # that hand it the full path instead (see images/binfmt/bin).
+    mkdir -p "$ctx/binfmt"
+    cp "$VEDROID_SRC"/images/binfmt/etc/* "$ctx/binfmt/"
+    chmod 0755 "$ctx/binfmt"; chmod 0644 "$ctx"/binfmt/*
+    echo "COPY binfmt/ /system/etc/binfmt_misc/" >> "$ctx/Dockerfile"
+    cp "$VEDROID_SRC"/images/binfmt/bin/* "$ctx/sysbin/"
   fi
   if [[ $magisk == 1 ]]; then
     "$VEDROID_SRC/images/magisk/prepare.sh" "$ctx/magisk"
     echo "COPY magisk /" >> "$ctx/Dockerfile"
+    # Magisk lives in /sbin, which is not on PATH in Android 11+, and apps cannot
+    # enter /system/xbin (0750 root:shell) where AOSP's su is. /system/bin comes
+    # first on PATH, so this makes "su" Magisk's for apps and the shell alike.
+    ln -s /sbin/su "$ctx/sysbin/su"
+  fi
+  if [[ -n "$(ls -A "$ctx/sysbin")" ]]; then
+    chmod 0751 "$ctx/sysbin"
+    echo "COPY --chown=0:2000 sysbin/ /system/bin/" >> "$ctx/Dockerfile"
   fi
   info "building $tag"
   engine build --pull -t "$tag" "$ctx" || { rm -rf "$ctx"; die "image build failed"; }
@@ -353,6 +385,10 @@ cmd_recreate() {
   if [[ "$MAGISK" == 1 ]]; then cmd_build_image --android "$ANDROID"; else cmd_build_image --android "$ANDROID" --no-magisk; fi
   cmd_stop "$NAME"
   engine rm -f "$(cname "$NAME")" >/dev/null 2>&1 || true
+  if [[ -n "$(stale_binfmt)" ]]; then
+    info "clearing stale binfmt_misc entries (other running instances need a recreate too)"
+    clean_binfmt
+  fi
   cmd_start "$NAME"
 }
 
@@ -401,6 +437,10 @@ cmd_adb()   { load_inst "${1:?adb <name> ...}"; shift; adb connect "$(serial)" >
 cmd_view() {
   load_inst "${1:?view <name>}"; shift
   need scrcpy "https://github.com/Genymobile/scrcpy"
+  local v; v="$(scrcpy --version 2>/dev/null | sed -n 's/^scrcpy \([0-9]*\)\..*/\1/p' | head -n1)"
+  if [[ -n "$v" && "$v" -lt 2 ]]; then
+    info "warning: scrcpy $v.x cannot inject input on Android 14; install 2.x or newer (snap install scrcpy, or https://github.com/Genymobile/scrcpy/releases)"
+  fi
   adb connect "$(serial)" >/dev/null
   scrcpy -s "$(serial)" --window-title "vedroid: $NAME (Android $ANDROID)" "$@"
 }

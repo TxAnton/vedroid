@@ -12,6 +12,14 @@ Status: early. Android 14 + Magisk boots on an x86_64 host; see [docs/design.md]
 
 ## Host setup
 
+Put the CLI on your PATH if you like (the rest of this README writes `./vedroid`):
+
+```sh
+mkdir -p ~/.local/bin && ln -s "$PWD/vedroid" ~/.local/bin/vedroid
+```
+
+`vedroid view` needs scrcpy 2.x or newer for Android 14; Ubuntu 24.04's package is 1.25, which shows the screen but cannot send input. Use `snap install scrcpy` or a release from GitHub.
+
 You need a Linux kernel with the binder driver, plus Docker or Podman, `adb`, `scrcpy` and `zstd`.
 
 ```sh
@@ -27,14 +35,7 @@ If `binder_linux` is missing, install your distro's extra kernel modules (on Ubu
 
 To run ARM *executables* (not just libraries), Redroid's init registers `arm64_exe`, `arm64_dyn`, `arm_exe` and `arm_dyn` in `binfmt_misc`. That table is global to the host kernel, so the entries show up in the host's `/proc/sys/fs/binfmt_misc` and stay after the container stops. They point at a path that exists only inside Android, so on the host itself ARM binaries fail with "not found", and they conflict with `qemu-user-static` if you install it.
 
-The stock entries use the `P` flag, which breaks ARM programs started by name through `PATH` (Termux's setup fails, for example). Vedroid images ship the same entries without `P`. An existing entry is never replaced, so clear the old ones once and recreate your instances:
-
-```sh
-sudo ./vedroid host-setup --clean-binfmt
-./vedroid recreate main
-```
-
-`host-check` warns when stale entries are present.
+The stock entries call the translator in a way that breaks ARM programs started by name through `PATH` (Termux's setup fails, for example). Vedroid images register small wrappers instead (`images/binfmt/`). An existing entry is never replaced, so `vedroid recreate` clears stale entries before it boots the instance; `host-check` warns about them, and `vedroid host-setup --clean-binfmt` clears them by hand. Clearing affects every running instance until it is recreated or restarted.
 
 ## Quick start
 

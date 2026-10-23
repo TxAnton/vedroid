@@ -41,15 +41,10 @@ for so in "$tmp/lib/$ABI"/lib*.so; do
 done
 install -m 0644 "$apk" "$dest/magisk.apk"
 
-# Magisk is set up in /sbin, which is not on PATH in Android 11+. Put su on
-# PATH ahead of the AOSP one: /system/bin comes before /system/xbin, and apps
-# cannot enter /system/xbin (0750 root:shell), so without this link an app's
-# "su" is not found at all. /system/xbin/su itself is left in place.
-mkdir -p "$OUT/system/bin"
-ln -s /sbin/su "$OUT/system/bin/su"
-
 # Magisk rewrites bootanim.rc when updated from its app; keep the stock one
 # next to it so Magisk can restore it.
 gzip -9 -n -c "$HERE/bootanim.stock.rc" > "$OUT/system/etc/init/bootanim.rc.gz"
 cat "$HERE/bootanim.stock.rc" "$HERE/magisk.rc" > "$OUT/system/etc/init/bootanim.rc"
 chmod 0644 "$OUT/system/etc/init/bootanim.rc" "$OUT/system/etc/init/bootanim.rc.gz"
+# COPY applies these modes to the existing image directories; keep them stock.
+chmod 0755 "$OUT" "$OUT/system" "$OUT/system/etc" "$OUT/system/etc/init" "$dest"

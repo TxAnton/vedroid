@@ -1,0 +1,9 @@
+#!/system/bin/sh
+# binfmt_misc interpreter for arm ELF files (registered with flag P).
+# The kernel runs: <this> <full path> <argv0> <args...>. The ndk_translation
+# runner realpath()s argv0, which fails for a bare name found through PATH,
+# so pass the full path in that case. A path-like argv0 (symlink names for
+# multi-call binaries, ./prog) is kept as is.
+f="$1"; a0="$2"; shift 2
+case "$a0" in */*) ;; *) a0="$f" ;; esac
+exec /system/bin/ndk_translation_program_runner_binfmt_misc "$f" "$a0" "$@"
