@@ -21,7 +21,8 @@ The full write-up is the "Vedroid: Android container design" doc. This file keep
 
 ## Known caveats
 
-- The Redroid 14 x86_64 image has 64-bit `libndk_translation` only (`/system/lib/libnb.so` dangles; 32-bit zygote logs "Failed to load native bridge"). armeabi-v7a apps are not supported there. Android 11/12 images are expected to ship both; verify before relying on it.
+- The Redroid 13 and 14 x86_64 images have 64-bit `libndk_translation` only (`/system/lib/libnb.so` dangles; 32-bit zygote logs "Failed to load native bridge"). armeabi-v7a apps are not supported there. Android 11/12 images are expected to ship both; verify before relying on it.
+- Tested on 2026-10-23: snapshot + restore on a throwaway 14 instance (files back, boots, Magisk OK; `rm` without sudo); `backup-app`/`restore-app` of Termux within main and into a fresh Android 13 instance (data re-owned to the new UID, arm64 bash runs on 13). On 13, Magisk itself places `/system/bin/su -> ./magisk`.
 - Zygisk (Magisk's in-process hooks) can break libndk for 32-bit ARM apps. Leave it off unless a module needs it.
 - microG needs signature spoofing. AOSP 14 has none, so `vedroid microg` uses the runtime route: Zygisk + Vector (LSPosed) v2.2 + FakeGApps 6.6 scoped to `system`, microG and the Companion, configured with Vector's own CLI (`/data/adb/lspd/cli`). Tested on Android 14: Self-Check passes "System spoofs signature" and both "correct signature" checks; arm64 apps (Termux) still run with Zygisk on. Zygisk can break 32-bit libndk, which the 14 image lacks anyway. An image with spoofing built in (Redroid from source with the microG patch) would avoid Zygisk.
 - microG is installed as a Magisk module with `system/priv-app/{GmsCore,Phonesky}`, native libraries pre-extracted, and a privapp-permissions XML. A user-installed copy of either package makes `vedroid microg` stop.

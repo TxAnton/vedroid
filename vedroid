@@ -614,6 +614,7 @@ PACKAGE=$pkg
 SOURCE_INSTANCE=$NAME
 SOURCE_ANDROID=$ANDROID
 VERSION=$(rsh "dumpsys package $pkg" | tr -d '\r' | sed -n 's/^ *versionName=//p' | head -n1)
+ABI_OVERRIDE=$(rsh "dumpsys package $pkg" | tr -d '\r' | sed -n 's/^ *cpuAbiOverride=//p' | grep -vx null | head -n1)
 CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
   info "backup written to $out"
@@ -628,9 +629,13 @@ cmd_restore_app() {
   adb connect "$(serial)" >/dev/null
   adb_i root >/dev/null 2>&1 || true
 
-  info "installing $PACKAGE"
+  # An app installed with --abi (e.g. arm64-v8a on x86_64) keeps that ABI, so
+  # its data (native binaries, paths) still matches.
+  local abi; abi="$(sed -n 's/^ABI_OVERRIDE=//p' "$src/meta.env")"
+  local opts=( -r ); [[ -n "$abi" ]] && opts+=( --abi "$abi" )
+  info "installing $PACKAGE${abi:+ (ABI $abi)}"
   local apks=( "$src"/apk/*.apk )
-  if [[ ${#apks[@]} -eq 1 ]]; then adb_i install -r "${apks[0]}"; else adb_i install-multiple -r "${apks[@]}"; fi
+  if [[ ${#apks[@]} -eq 1 ]]; then adb_i install "${opts[@]}" "${apks[0]}"; else adb_i install-multiple "${opts[@]}" "${apks[@]}"; fi
   local uid; uid="$(pkg_uid "$PACKAGE")"
   # cache dirs use the app's cache gid: 20000 + appId (appId = uid % 100000 - 10000)
   local appid=$(( uid % 100000 - 10000 ))

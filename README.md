@@ -4,7 +4,7 @@ Android instances in containers on a Linux PC or VM, built on [Redroid](https://
 
 - several instances side by side, each on its own Android version (8.1 to 16, default 14)
 - root over adb, plus per-app root inside Android through Magisk
-- ARM64 apps on x86_64 hosts through `libndk_translation` (included in Redroid images). The Android 14 image has no 32-bit translation, so armeabi-v7a-only apps do not run there; Android 11/12 images are expected to ship both (not yet verified)
+- ARM64 apps on x86_64 hosts through `libndk_translation` (included in Redroid images). The Android 13 and 14 images have no 32-bit translation, so armeabi-v7a-only apps do not run there; Android 11/12 images are expected to ship both (not yet verified)
 - no Google services by default; `vedroid microg` adds microG with signature spoofing (see below)
 - full instance snapshots and per-app backup and restore
 
@@ -96,7 +96,7 @@ The instance restarts a few times. Running it again only does what is missing. C
 ./vedroid restore-app legacy ~/.local/share/vedroid/app-backups/org.example.notes/<backup>
 ```
 
-Per-app backups contain the app's APKs (including splits) and its internal, device-protected and external app-specific data. On restore, files are re-owned to the app's new UID and their SELinux labels are reset. This means you can move an app into a different instance or Android version.
+Per-app backups contain the app's APKs (including splits), its internal, device-protected and external app-specific data, and its forced ABI if it was installed with `--abi` (so an arm64 install stays arm64 on restore). On restore, files are re-owned to the app's new UID and their SELinux labels are reset. This means you can move an app into a different instance or Android version.
 
 ## Layout
 
