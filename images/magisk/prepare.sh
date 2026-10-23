@@ -40,6 +40,10 @@ for so in "$tmp/lib/$ABI"/lib*.so; do
   install -m 0755 "$so" "$dest/${name#lib}"
 done
 install -m 0644 "$apk" "$dest/magisk.apk"
+# --setup-sbin copies stub.apk to /sbin; magiskd trusts only manager APKs signed
+# like it, and without it uninstalls the app as a "signature mismatch".
+unzip -q -o "$apk" assets/stub.apk -d "$tmp"
+install -m 0644 "$tmp/assets/stub.apk" "$dest/stub.apk"
 
 # Magisk rewrites bootanim.rc when updated from its app; keep the stock one
 # next to it so Magisk can restore it.

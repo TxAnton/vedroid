@@ -442,7 +442,12 @@ cmd_view() {
     info "warning: scrcpy $v.x cannot inject input on Android 14; install 2.x or newer (snap install scrcpy, or https://github.com/Genymobile/scrcpy/releases)"
   fi
   adb connect "$(serial)" >/dev/null
-  scrcpy -s "$(serial)" --window-title "vedroid: $NAME (Android $ANDROID)" "$@"
+  # Redroid has no Opus encoder, so default to AAC audio. ADB= keeps scrcpy on
+  # the system adb: a bundled, newer adb restarts the server and drops the
+  # 127.0.0.1:<port> connection.
+  local extra=()
+  [[ " $* " == *" --no-audio "* || " $* " == *"--audio-codec"* ]] || extra+=(--audio-codec=aac)
+  ADB="$(command -v adb)" scrcpy -s "$(serial)" --window-title "vedroid: $NAME (Android $ANDROID)" "${extra[@]}" "$@"
 }
 
 cmd_install() {

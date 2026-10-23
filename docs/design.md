@@ -27,7 +27,8 @@ The full write-up is the "Vedroid: Android container design" doc. This file keep
 - `bootanim.stock.rc` uses `task_profiles`, so Magisk images require Android 11 or newer.
 - Redroid on a non-SELinux host runs with SELinux disabled, so `magiskpolicy --live` is skipped when `/sys/fs/selinux/enforce` is missing.
 - Redroid images are userdebug builds and ship AOSP `/system/xbin/su` (setuid, `root:shell` 4750, syntax `su [uid] [cmd]`). Only the shell user can run it. It is left in place; test Magisk with `/sbin/su` explicitly.
-- The ayasa520 APK is signed with the Android debug key, and its daemon rejects it: on the first su request that needs a prompt, magiskd logs "APK signature mismatch" and uninstalls the Magisk app. Grants from the host (`su-allow`) keep working; prompts and the Magisk UI do not.
+- magiskd takes its trusted manager certificate from `stub.apk` next to the binaries (`--setup-sbin` copies it). Without it every manager APK "mismatches" and magiskd uninstalls the Magisk app, so the image ships the APK's `assets/stub.apk`. With it, the app survives and the Superuser prompt works (unanswered, it times out to a saved "deny").
+- At boot magiskd installs the stub (`pm_install: /data/stub.apk`); it reports 30.6 and opens normally. Post-fs-data logs "Magisk environment incomplete" because `/data/adb/magisk` is empty, and the app asks for "additional setup" with a reboot. Not done yet; root grants work without it, modules probably need it.
 - Magisk logs `mount: preinit dir not found`. Root grants work; module mounting is untested.
 
 ## Next

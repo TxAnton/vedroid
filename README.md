@@ -19,6 +19,8 @@ mkdir -p ~/.local/bin && ln -s "$PWD/vedroid" ~/.local/bin/vedroid
 ```
 
 `vedroid view` needs scrcpy 2.x or newer for Android 14; Ubuntu 24.04's package is 1.25, which shows the screen but cannot send input. Use `snap install scrcpy` or a release from GitHub.
+- Redroid has no Opus encoder, so `vedroid view` passes `--audio-codec=aac` unless you pass `--no-audio` or your own `--audio-codec`.
+- scrcpy releases bundle their own adb; `vedroid view` sets `ADB` to the system adb, because a different adb version restarts the server and drops the instance's `127.0.0.1:<port>` connection.
 
 You need a Linux kernel with the binder driver, plus Docker or Podman, `adb`, `scrcpy` and `zstd`.
 
