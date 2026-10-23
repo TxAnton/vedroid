@@ -9,6 +9,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CACHE="${VEDROID_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/vedroid}"
 
 # Magisk build that supports running without a boot image on Redroid.
+# The fork's v30.7 release tag ships Magisk 30.6 (versionCode 30600).
 MAGISK_URL="https://github.com/ayasa520/Magisk/releases/download/v30.7/Magisk-v30.7.apk"
 MAGISK_SHA256="a1292054b25c31f19f4cdc3f33b8b48020574fc237eabd7633e54193698ac396"
 
@@ -39,6 +40,13 @@ for so in "$tmp/lib/$ABI"/lib*.so; do
   install -m 0755 "$so" "$dest/${name#lib}"
 done
 install -m 0644 "$apk" "$dest/magisk.apk"
+
+# Magisk is set up in /sbin, which is not on PATH in Android 11+. Put su on
+# PATH ahead of the AOSP one: /system/bin comes before /system/xbin, and apps
+# cannot enter /system/xbin (0750 root:shell), so without this link an app's
+# "su" is not found at all. /system/xbin/su itself is left in place.
+mkdir -p "$OUT/system/bin"
+ln -s /sbin/su "$OUT/system/bin/su"
 
 # Magisk rewrites bootanim.rc when updated from its app; keep the stock one
 # next to it so Magisk can restore it.

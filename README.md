@@ -8,7 +8,7 @@ Android instances in containers on a Linux PC or VM, built on [Redroid](https://
 - no Google services; microG is planned (see [docs/design.md](docs/design.md))
 - full instance snapshots and per-app backup and restore
 
-Status: first pass. The CLI has not yet been run against a live instance.
+Status: early. Android 14 + Magisk boots on an x86_64 host; see [docs/design.md](docs/design.md) for what has been tested.
 
 ## Host setup
 
@@ -19,7 +19,9 @@ sudo ./vedroid host-setup     # loads binder_linux and keeps it loaded on boot
 ./vedroid host-check
 ```
 
-If `binder_linux` is missing, install your distro's extra kernel modules (on Ubuntu, `linux-modules-extra-$(uname -r)`). Put `/srv/vedroid` on btrfs to get instant snapshots. On other filesystems, snapshots fall back to compressed tarballs that keep UIDs and SELinux labels.
+`host-setup` is the only step that needs sudo. Data lives in `~/.local/share/vedroid` (or `$VEDROID_HOME`), owned by you. Files that Android writes as root or app UIDs are handled through a throwaway helper container (`vedroid/helper:1`, alpine + GNU tar), so your user only needs to be in the `docker` group.
+
+If `binder_linux` is missing, install your distro's extra kernel modules (on Ubuntu, `linux-modules-extra-$(uname -r)`). On btrfs, snapshots are instant subvolume snapshots, but those commands need sudo. On other filesystems, snapshots fall back to compressed tarballs that keep UIDs and SELinux labels.
 
 ## Quick start
 
@@ -43,6 +45,13 @@ The first `create` for a given version builds the `vedroid/android:<ver>-magisk`
 ./vedroid su-list  main
 ```
 
+Magisk runs from `/sbin` (Magisk 30.6, from the ayasa520 fork's v30.7 release). `/sbin` is not on Android's PATH, so the image links `/system/bin/su` to `/sbin/su`. The stock AOSP `/system/xbin/su` is left in place, but `/system/bin` comes first on PATH, and apps cannot enter `/system/xbin` anyway. To test a grant from the host as the shell user (uid 2000):
+
+```sh
+./vedroid su-allow main com.android.shell
+./vedroid shell main '/sbin/su 2000 -c "/sbin/su -c id"'   # -> uid=0(root)
+```
+
 ## Backups
 
 ```sh
@@ -51,7 +60,7 @@ The first `create` for a given version builds the `vedroid/android:<ver>-magisk`
 ./vedroid restore main 20261023-153144-before-update
 
 ./vedroid backup-app main org.example.notes            # APKs + data
-./vedroid restore-app legacy /srv/vedroid/app-backups/org.example.notes/<backup>
+./vedroid restore-app legacy ~/.local/share/vedroid/app-backups/org.example.notes/<backup>
 ```
 
 Per-app backups contain the app's APKs (including splits) and its internal, device-protected and external app-specific data. On restore, files are re-owned to the app's new UID and their SELinux labels are reset. This means you can move an app into a different instance or Android version.
@@ -59,7 +68,7 @@ Per-app backups contain the app's APKs (including splits) and its internal, devi
 ## Layout
 
 ```
-/srv/vedroid/
+~/.local/share/vedroid/            ($VEDROID_HOME; /srv/vedroid when run as plain root)
   instances/<name>/instance.env   version, image, adb port, display
   instances/<name>/data/          the instance's /data (btrfs subvolume if available)
   instances/<name>/snapshots/     full snapshots

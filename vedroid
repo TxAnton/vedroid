@@ -5,11 +5,29 @@
 # shellcheck disable=SC2153
 set -euo pipefail
 
-VEDROID_HOME="${VEDROID_HOME:-/srv/vedroid}"
+default_home() {
+  # Per-user data root, so normal use needs no sudo. Under sudo, keep using the
+  # invoking user's root; plain root falls back to /srv/vedroid.
+  if [[ $EUID -ne 0 ]]; then
+    echo "${XDG_DATA_HOME:-$HOME/.local/share}/vedroid"
+  elif [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]; then
+    echo "$(getent passwd "$SUDO_USER" | cut -d: -f6)/.local/share/vedroid"
+  else
+    echo /srv/vedroid
+  fi
+}
+
+VEDROID_HOME="${VEDROID_HOME:-$(default_home)}"
 VEDROID_ENGINE="${VEDROID_ENGINE:-docker}"
 VEDROID_SRC="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 DEFAULT_ANDROID="14.0.0"
 BASE_PORT=5555
+# Bootless Magisk lives in /sbin, which is not on PATH in Android 11+.
+MAGISK_BIN=/sbin/magisk
+# Image for root-owned file work under VEDROID_HOME (Android writes /data as
+# root and app UIDs), so the host side never needs sudo. Debian ships GNU tar
+# with xattr/ACL support, so nothing is installed at runtime.
+HELPER_IMAGE="debian:bookworm-slim"
 
 die()  { echo "vedroid: $*" >&2; exit 1; }
 info() { echo "==> $*" >&2; }
@@ -50,7 +68,8 @@ Backups
   restore-app <name> <backup-dir>
                                  Restore an app backup, into any instance or version
 
-Environment: VEDROID_HOME (default /srv/vedroid), VEDROID_ENGINE (docker|podman)
+Environment: VEDROID_HOME (default ~/.local/share/vedroid; /srv/vedroid as plain root),
+             VEDROID_ENGINE (docker|podman)
 EOF
 }
 
@@ -93,7 +112,23 @@ next_port() {
   echo "$p"
 }
 
-is_btrfs() { [[ "$(stat -f -c %T "$1" 2>/dev/null)" == btrfs ]]; }
+fs_type() { # <path> -> filesystem type (findmnt knows ext4 from ext2/3; stat -f does not)
+  findmnt -no FSTYPE -T "$1" 2>/dev/null || stat -f -c %T "$1" 2>/dev/null || echo '?'
+}
+
+is_btrfs() { [[ "$(fs_type "$1")" == btrfs ]]; }
+
+ensure_helper() { # call before stopping anything, so a failed pull leaves the instance alone
+  engine image inspect "$HELPER_IMAGE" >/dev/null 2>&1 && return 0
+  info "pulling $HELPER_IMAGE (helper for root-owned files)"
+  engine pull -q "$HELPER_IMAGE" >/dev/null || die "cannot pull $HELPER_IMAGE"
+}
+
+as_root() { # <dir> <sh script>: run script as root with <dir> mounted at /w; stdin is passed through
+  local dir; dir="$(readlink -f "$1")"; shift
+  # --privileged so root may read/write any xattr, same as running under sudo.
+  engine run --rm -i --privileged --network none -v "$dir:/w" --entrypoint /bin/sh "$HELPER_IMAGE" -c "$1"
+}
 
 running() { [[ "$(engine inspect -f '{{.State.Running}}' "$(cname "$1")" 2>/dev/null)" == true ]]; }
 
@@ -142,7 +177,7 @@ cmd_host_check() {
     if command -v "$t" >/dev/null; then echo "$t: ok"; else echo "$t: missing (optional for some commands)"; fi
   done
   mkdir -p "$VEDROID_HOME" 2>/dev/null || true
-  if is_btrfs "$VEDROID_HOME"; then echo "storage:  btrfs (instant snapshots)"; else echo "storage:  $(stat -f -c %T "$VEDROID_HOME" 2>/dev/null || echo '?') (snapshots use tar)"; fi
+  if is_btrfs "$VEDROID_HOME"; then echo "storage:  btrfs (instant snapshots; needs sudo)"; else echo "storage:  $(fs_type "$VEDROID_HOME") (snapshots use tar)"; fi
   echo "cpu:      $(uname -m)"
   [[ $ok == 1 ]] || exit 1
 }
@@ -151,7 +186,14 @@ cmd_host_setup() {
   [[ $EUID -eq 0 ]] || die "host-setup needs root"
   modprobe binder_linux devices="binder,hwbinder,vndbinder" || die "cannot load binder_linux; install your distro's extra kernel modules (e.g. linux-modules-extra-$(uname -r))"
   modprobe ashmem_linux 2>/dev/null || true
-  mkdir -p "$VEDROID_HOME/instances" "$VEDROID_HOME/app-backups"
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]; then
+    # Create it as the invoking user, so later commands need no sudo.
+    runuser -u "$SUDO_USER" -- mkdir -p "$VEDROID_HOME/instances" "$VEDROID_HOME/app-backups" 2>/dev/null \
+      || mkdir -p "$VEDROID_HOME/instances" "$VEDROID_HOME/app-backups"
+    chown "$SUDO_USER:" "$VEDROID_HOME" "$VEDROID_HOME/instances" "$VEDROID_HOME/app-backups"
+  else
+    mkdir -p "$VEDROID_HOME/instances" "$VEDROID_HOME/app-backups"
+  fi
   cat > /etc/modules-load.d/vedroid.conf <<'EOF'
 binder_linux
 EOF
@@ -289,6 +331,11 @@ cmd_rm() {
       [[ -d "$s" ]] && btrfs subvolume delete "$s" >/dev/null 2>&1 || true
     done
   fi
+  # data/ is owned by Android's root and app UIDs; delete it as root.
+  if [[ -d "$dir/data" ]]; then
+    ensure_helper
+    as_root "$dir" 'rm -rf /w/data /w/data.before-restore-*' </dev/null
+  fi
   rm -rf "$dir"
   info "removed $NAME and its data"
 }
@@ -334,13 +381,13 @@ pkg_uid() { # <package> -> app uid, from the loaded instance
   echo "$uid"
 }
 
-magisk_sql() { rsh "magisk --sqlite \"$1\""; }
+magisk_sql() { rsh "$MAGISK_BIN --sqlite \"$1\""; }
 
 require_magisk() {
   [[ "$MAGISK" == 1 ]] || die "$NAME was created with --no-magisk"
   running "$NAME" || die "$NAME is not running"
   adb connect "$(serial)" >/dev/null
-  rsh "command -v magisk >/dev/null" || die "magisk is not active in $NAME yet; open the Magisk app once to finish setup"
+  rsh "test -x $MAGISK_BIN" || die "magisk daemon not found in $NAME ($MAGISK_BIN missing); check '$VEDROID_ENGINE logs $(cname "$NAME")'"
 }
 
 cmd_su_allow() {
@@ -383,17 +430,27 @@ cmd_snapshot() {
   local id="$ts${label:+-$label}"
   [[ "$id" =~ ^[A-Za-z0-9_.-]+$ ]] || die "label may only use letters, digits, . _ -"
   local dir; dir="$(inst_dir "$NAME")"
+  local use_btrfs=0
+  if is_btrfs "$dir/data" && btrfs subvolume show "$dir/data" >/dev/null 2>&1; then
+    use_btrfs=1
+  else
+    need zstd "install zstd"
+    ensure_helper
+  fi
   local was_running=0
   running "$NAME" && { was_running=1; cmd_stop "$NAME"; }
   mkdir -p "$dir/snapshots"
-  if is_btrfs "$dir/data" && btrfs subvolume show "$dir/data" >/dev/null 2>&1; then
+  if [[ $use_btrfs == 1 ]]; then
     btrfs subvolume snapshot -r "$dir/data" "$dir/snapshots/$id" >/dev/null
   else
-    need zstd "install zstd"
     mkdir -p "$dir/snapshots/$id"
     # --xattrs keeps SELinux labels; --numeric-owner keeps Android uids
-    tar --numeric-owner --xattrs --xattrs-include='*' --acls -C "$dir/data" -cf - . \
-      | zstd -q -T0 -o "$dir/snapshots/$id/data.tar.zst"
+    if ! as_root "$dir" "tar --numeric-owner --xattrs --xattrs-include='*' --acls --warning=no-file-ignored -C /w/data -cf - ." </dev/null \
+      | zstd -q -T0 -o "$dir/snapshots/$id/data.tar.zst"; then
+      rm -rf "${dir:?}/snapshots/$id"
+      [[ $was_running == 1 ]] && cmd_start "$NAME"
+      die "snapshot of $NAME failed; nothing saved"
+    fi
   fi
   cp "$(inst_conf "$NAME")" "$dir/snapshots/$id.env"
   [[ $was_running == 1 ]] && cmd_start "$NAME"
@@ -414,20 +471,21 @@ cmd_restore() {
   local dir; dir="$(inst_dir "$NAME")"
   local snap="$dir/snapshots/$id"
   [[ -e "$snap" && -f "$snap.env" ]] || die "no snapshot '$id' for $NAME"
+  [[ -f "$snap/data.tar.zst" ]] && { need zstd "install zstd"; ensure_helper; }
   cmd_stop "$NAME"
   # The snapshot remembers which image it ran on; restore that too.
   engine rm -f "$(cname "$NAME")" >/dev/null 2>&1 || true
   local old
-  old="$dir/data.before-restore-$(date -u +%Y%m%d-%H%M%S)"
-  mv "$dir/data" "$old"
+  old="data.before-restore-$(date -u +%Y%m%d-%H%M%S)"
   if [[ -f "$snap/data.tar.zst" ]]; then
-    mkdir -p "$dir/data"
-    zstd -dc "$snap/data.tar.zst" | tar --numeric-owner --xattrs --xattrs-include='*' --acls -C "$dir/data" -xf -
+    zstd -dc "$snap/data.tar.zst" | as_root "$dir" "mv /w/data /w/$old && mkdir /w/data && chmod 0771 /w/data && tar --numeric-owner --xattrs --xattrs-include='*' --acls -C /w/data -xf -" \
+      || die "restore failed; previous data is at $dir/$old (if it was moved), the snapshot is untouched"
   else
+    mv "$dir/data" "$dir/$old"
     btrfs subvolume snapshot "$snap" "$dir/data" >/dev/null
   fi
   cp "$snap.env" "$(inst_conf "$NAME")"
-  info "restored $NAME to $id; previous data kept at $old (delete it when happy)"
+  info "restored $NAME to $id; previous data kept at $dir/$old (delete it when happy)"
   cmd_start "$NAME"
 }
 
