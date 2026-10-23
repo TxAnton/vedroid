@@ -111,8 +111,17 @@ image_tag() { # <android> <magisk:0|1>
 next_port() {
   local p=$BASE_PORT used
   used="$(cat "$VEDROID_HOME"/instances/*/instance.env 2>/dev/null | sed -n 's/^PORT=//p')"
-  while grep -qx "$p" <<<"$used"; do p=$((p + 1)); done
+  # Skip ports other instances own and ports something else listens on (another
+  # Redroid, a phone's adb forward, ...).
+  while grep -qx "$p" <<<"$used" || port_busy "$p"; do p=$((p + 1)); done
   echo "$p"
+}
+
+port_busy() { ss -Htln "( sport = :$1 )" 2>/dev/null | grep -q .; }
+
+foreign_redroid() { # running Redroid containers not managed by vedroid
+  engine ps --format '{{.Names}} {{.Image}}' 2>/dev/null \
+    | awk '$1 !~ /^vedroid-/ && $2 ~ /redroid/ {print $1}' | paste -sd, -
 }
 
 fs_type() { # <path> -> filesystem type (findmnt knows ext4 from ext2/3; stat -f does not)
@@ -183,6 +192,8 @@ cmd_host_check() {
   if is_btrfs "$VEDROID_HOME"; then echo "storage:  btrfs (instant snapshots; needs sudo)"; else echo "storage:  $(fs_type "$VEDROID_HOME") (snapshots use tar)"; fi
   echo "cpu:      $(uname -m)"
   local stale; stale="$(stale_binfmt)"
+  local other; other="$(foreign_redroid)"
+  [[ -n "$other" ]] && echo "redroid:  other Redroid containers running: $other (they share binder and binfmt_misc; mind adb ports)"
   if [[ -n "$stale" ]]; then
     echo "binfmt:   WARNING stale entries:$stale (ARM programs started via PATH may fail)"
     echo "          fix: vedroid recreate <name> (clears them), or vedroid host-setup --clean-binfmt"
@@ -387,8 +398,15 @@ cmd_recreate() {
   cmd_stop "$NAME"
   engine rm -f "$(cname "$NAME")" >/dev/null 2>&1 || true
   if [[ -n "$(stale_binfmt)" ]]; then
-    info "clearing stale binfmt_misc entries (other running instances need a recreate too)"
-    clean_binfmt
+    local other; other="$(foreign_redroid)"
+    if [[ -n "$other" ]]; then
+      # Their images point the same entries at the stock runner, which our
+      # wrapper path would break; leave the host table to them.
+      info "warning: not touching binfmt_misc while other Redroid containers run ($other); ARM programs started by bare name may fail in $NAME"
+    else
+      info "clearing stale binfmt_misc entries (other running instances need a recreate too)"
+      clean_binfmt
+    fi
   fi
   cmd_start "$NAME"
 }
