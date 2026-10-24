@@ -22,16 +22,25 @@ mkdir -p ~/.local/bin && ln -s "$PWD/vedroid" ~/.local/bin/vedroid
 - Redroid has no Opus encoder, so `vedroid view` passes `--audio-codec=aac` unless you pass `--no-audio` or your own `--audio-codec`.
 - scrcpy releases bundle their own adb; `vedroid view` sets `ADB` to the system adb, because a different adb version restarts the server and drops the instance's `127.0.0.1:<port>` connection.
 
-You need a Linux kernel with the binder driver, plus Docker or Podman, `adb`, `scrcpy` and `zstd`.
+You need an x86_64 Linux host with the binder driver, Docker (or Podman) with your user in the `docker` group, `adb`, `zstd`, `curl`, `unzip`, and for `vedroid view` scrcpy 2.x or newer.
 
 ```sh
-sudo ./vedroid host-setup     # loads binder_linux and keeps it loaded on boot
+# Ubuntu 22.04 / 24.04 / Linux Mint
+sudo apt install docker.io adb zstd curl unzip
+# Ubuntu 20.04: the same packages work (adb 1.0.39 is fine for everything except scrcpy);
+# the repo's scrcpy is 1.12, far too old, so use the snap or a GitHub release instead
+sudo snap install scrcpy
+
+sudo usermod -aG docker "$USER"   # then log out and back in
+sudo ./vedroid host-setup         # loads binder_linux and keeps it loaded on boot
 ./vedroid host-check
 ```
 
-`host-setup` is the only step that needs sudo. Data lives in `~/.local/share/vedroid` (or `$VEDROID_HOME`), owned by you. Files that Android writes as root or app UIDs are handled through a throwaway helper container (`vedroid/helper:1`, alpine + GNU tar), so your user only needs to be in the `docker` group.
+`host-setup` is the only step that needs sudo. Data lives in `~/.local/share/vedroid` (or `$VEDROID_HOME`), owned by you. Files that Android writes as root or app UIDs are handled through a throwaway helper container (`debian:bookworm-slim`, which has GNU tar), so your user only needs to be in the `docker` group.
 
-If `binder_linux` is missing, install your distro's extra kernel modules (on Ubuntu, `linux-modules-extra-$(uname -r)`). On btrfs, snapshots are instant subvolume snapshots, but those commands need sudo. On other filesystems, snapshots fall back to compressed tarballs that keep UIDs and SELinux labels.
+If `binder_linux` is missing, install your distro's extra kernel modules (on Ubuntu, `linux-modules-extra-$(uname -r)`; the 20.04 HWE kernel 5.15 already has it). Plan for about 2.1 GB of disk per Android version (the image) plus a few hundred MB per instance. On btrfs, snapshots are instant subvolume snapshots, but those commands need sudo. On other filesystems, snapshots fall back to compressed tarballs that keep UIDs and SELinux labels.
+
+Tested hosts: Linux Mint (kernel 6.8, Docker 29) and Ubuntu 20.04 (kernel 5.15, Docker 28).
 
 ### binfmt_misc on the host
 

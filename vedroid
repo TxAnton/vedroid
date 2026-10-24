@@ -185,8 +185,9 @@ cmd_host_check() {
     echo "ashmem:   not loaded (fine, vedroid uses memfd)"
   fi
   if command -v "$VEDROID_ENGINE" >/dev/null; then echo "engine:   $VEDROID_ENGINE ok"; else echo "engine:   $VEDROID_ENGINE MISSING"; ok=0; fi
-  for t in adb scrcpy zstd; do
-    if command -v "$t" >/dev/null; then echo "$t: ok"; else echo "$t: missing (optional for some commands)"; fi
+  if command -v adb >/dev/null; then echo "adb:      ok"; else echo "adb:      MISSING (every instance command needs it)"; ok=0; fi
+  for t in zstd scrcpy; do
+    if command -v "$t" >/dev/null; then printf '%-9s ok\n' "$t:"; else printf '%-9s missing (%s)\n' "$t:" "$([[ $t == zstd ]] && echo "needed for snapshots and app backups" || echo "needed for 'vedroid view'")"; fi
   done
   mkdir -p "$VEDROID_HOME" 2>/dev/null || true
   if is_btrfs "$VEDROID_HOME"; then echo "storage:  btrfs (instant snapshots; needs sudo)"; else echo "storage:  $(fs_type "$VEDROID_HOME") (snapshots use tar)"; fi
@@ -582,7 +583,7 @@ cmd_restore() {
   local old
   old="data.before-restore-$(date -u +%Y%m%d-%H%M%S)"
   if [[ -f "$snap/data.tar.zst" ]]; then
-    zstd -dc "$snap/data.tar.zst" | as_root "$dir" "mv /w/data /w/$old && mkdir /w/data && chmod 0771 /w/data && tar --numeric-owner --xattrs --xattrs-include='*' --acls -C /w/data -xf -" \
+    zstd -q -dc "$snap/data.tar.zst" | as_root "$dir" "mv /w/data /w/$old && mkdir /w/data && chmod 0771 /w/data && tar --numeric-owner --xattrs --xattrs-include='*' --acls -C /w/data -xf -" \
       || die "restore failed; previous data is at $dir/$old (if it was moved), the snapshot is untouched"
   else
     mv "$dir/data" "$dir/$old"
@@ -661,7 +662,7 @@ cmd_restore_app() {
 
   info "restoring data of $PACKAGE (uid $uid)"
   rsh "am force-stop $PACKAGE"
-  zstd -dc "$src/data.tar.zst" > "$src/.restore.tar"
+  zstd -q -dc "$src/data.tar.zst" > "$src/.restore.tar"
   adb_i push "$src/.restore.tar" /data/local/tmp/vedroid-restore.tar >/dev/null
   rm -f "$src/.restore.tar"
   rsh "
