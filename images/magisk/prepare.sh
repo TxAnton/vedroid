@@ -49,6 +49,7 @@ install -m 0644 "$tmp/assets/stub.apk" "$dest/stub.apk"
 unzip -q -o "$apk" 'assets/*.sh' -d "$tmp"
 install -m 0755 "$tmp"/assets/*.sh "$dest/"
 install -m 0755 "$HERE/setup-data.sh" "$dest/vedroid-setup-data"
+install -m 0755 "$HERE/magisk-app.sh" "$dest/vedroid-magisk-app"
 
 # Magisk rewrites bootanim.rc when updated from its app; keep the stock one
 # next to it so Magisk can restore it.
